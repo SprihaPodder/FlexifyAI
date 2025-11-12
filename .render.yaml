@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: flexify-ai
+    env: python
+    runtime: python-3.11
+    buildCommand: pip install --upgrade pip setuptools wheel && pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.app:app --host 0.0.0.0 --port $PORT
