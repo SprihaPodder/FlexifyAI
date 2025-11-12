@@ -26,8 +26,9 @@ matplotlib==3.7.2
 seaborn==0.12.2
 
 
-pytesseract
-python-docx 
+pytesseract==0.3.10
+python-docx==1.0.0
+pillow==10.0.0
 
 
 
