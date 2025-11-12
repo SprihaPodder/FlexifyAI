@@ -36,7 +36,7 @@ from sklearn.model_selection import RandomizedSearchCV
 from scipy.stats import randint, uniform
 
 
-from PIL import Image, ImageStat
+from PIL import Image, ImageFilter, ImageStat
 import pytesseract
 import chardet
 from transformers import pipeline
@@ -62,6 +62,13 @@ from typing import Dict, List, Any
 import re
 import unicodedata
 from docx import Document
+
+
+
+
+from io import BytesIO
+from sklearn.cluster import KMeans
+
 
 
 
@@ -687,116 +694,569 @@ async def extract_entities(file: UploadFile = File(...)):
         return {"error": f"Failed to extract entities: {str(e)}"}
 
 
+def _img_to_base64(img: Image.Image, fmt="PNG") -> str:
+    buf = BytesIO()
+    img.save(buf, format=fmt)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+def _plot_histogram_as_base64(hist_vals, title="Color Histogram"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6,3))
+    ax.bar(range(len(hist_vals)), hist_vals)
+    ax.set_title(title)
+    plt.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    img_b64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close(fig)
+    return img_b64
+
+def _rgb_to_hex(rgb_tuple):
+    return '#{:02x}{:02x}{:02x}'.format(int(rgb_tuple[0]), int(rgb_tuple[1]), int(rgb_tuple[2]))
 
 
+# ---------------- Existing endpoints (process-image, extract-image-features, explain-image) ----------------
 @app.post("/process-image/")
 async def process_image(file: UploadFile = File(...)):
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
             content = await file.read()
-            temp_file.write(content)
-            temp_path = temp_file.name
-        img = Image.open(temp_path)
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        img = Image.open(tmp_path)
         width, height = img.size
+        fmt = img.format or "PNG"
+        mode = img.mode
+
+        extracted_text = ""
         try:
-            ocr_raw = pytesseract.image_to_string(img)
-            ocr_text = ''.join(c for c in ocr_raw if c.isprintable())
+            ocr_img = img.convert("RGB")
+            extracted_text = pytesseract.image_to_string(ocr_img).strip()
         except Exception:
-            ocr_text = "OCR failed or not available"
-        
-        analysis = {
+            extracted_text = ""
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        return {
             "dimensions": {"width": width, "height": height},
-            "format": img.format,
-            "mode": img.mode,
-            "extracted_text": ocr_text.strip() if ocr_text else "No text detected"
+            "format": fmt,
+            "mode": mode,
+            "extracted_text": extracted_text or ""
         }
-        img.close()
-        os.unlink(temp_path)
-        return analysis
+
     except Exception as e:
         return {"error": f"Failed to process image: {str(e)}"}
 
-@app.post("/image-features/")
-async def image_features(file: UploadFile = File(...)):
+@app.post("/extract-image-features/")
+async def extract_image_features(file: UploadFile = File(...), k_colors: int = Form(3)):
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
             content = await file.read()
-            temp_file.write(content)
-            temp_path = temp_file.name
-        img = Image.open(temp_path)
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        stat = ImageStat.Stat(img)
-        mode = img.mode
-        features = {}
-        if mode in ['RGB', 'RGBA']:
-            features["mean_color"] = { 
-                "R": round(stat.mean[0],2), 
-                "G": round(stat.mean[1],2), 
-                "B": round(stat.mean[2],2) 
-            }
-            features["stddev_color"] = { 
-                "R": round(stat.stddev[0],2), 
-                "G": round(stat.stddev[1],2), 
-                "B": round(stat.stddev[2],2)
-            }
-        else:
-            features["mean_gray"] = round(stat.mean[0],2)
-            features["stddev_gray"] = round(stat.stddev[0],2)
-        hist = img.histogram()
-        features["histogram_preview"] = hist[:32]
+        img = Image.open(tmp_path).convert("RGB")
+        width, height = img.size
 
-        img.close()
-        os.unlink(temp_path)
-        return features
+        stat = ImageStat.Stat(img.convert("L"))
+        avg_brightness = float(stat.mean[0])
+        contrast = float(stat.stddev[0])
+
+        arr = np.array(img)
+        pixels = arr.reshape(-1, 3).astype(np.float32)
+        max_samples = 30000
+        sample_pixels = pixels[np.random.choice(pixels.shape[0], min(pixels.shape[0], max_samples), replace=False)]
+
+        try:
+            km = KMeans(n_clusters=max(1, int(k_colors)), random_state=42)
+            km.fit(sample_pixels)
+            centers = km.cluster_centers_.astype(int)
+            dominant_hex = [_rgb_to_hex(tuple(center)) for center in centers]
+        except Exception:
+            avg_col = tuple(np.mean(sample_pixels, axis=0).astype(int).tolist())
+            dominant_hex = [_rgb_to_hex(avg_col)]
+
+        hist_r, _ = np.histogram(arr[:,:,0].flatten(), bins=32, range=(0,255))
+        hist_g, _ = np.histogram(arr[:,:,1].flatten(), bins=32, range=(0,255))
+        hist_b, _ = np.histogram(arr[:,:,2].flatten(), bins=32, range=(0,255))
+        hist_sum = (hist_r + hist_g + hist_b).tolist()
+        histogram_base64 = _plot_histogram_as_base64(hist_sum, title="Color Intensity Histogram")
+
+        edges = img.convert("L").filter(ImageFilter.FIND_EDGES)
+        edge_b64 = _img_to_base64(edges, fmt="PNG")
+
+        palette_img = Image.new("RGB", (len(dominant_hex)*40, 40))
+        for i, hx in enumerate(dominant_hex):
+            color = tuple(int(hx.lstrip("#")[j:j+2], 16) for j in (0,2,4))
+            sw = Image.new("RGB", (40,40), color)
+            palette_img.paste(sw, (i*40, 0))
+        palette_b64 = _img_to_base64(palette_img, fmt="PNG")
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        return {
+            "dominant_colors": dominant_hex,
+            "palette_image": palette_b64,
+            "histogram_image": histogram_base64,
+            "avg_brightness": round(avg_brightness, 2),
+            "contrast": round(contrast, 2),
+            "edge_image": edge_b64,
+            "width": width,
+            "height": height,
+            "format": img.format or "PNG"
+        }
     except Exception as e:
         return {"error": f"Failed to extract features: {str(e)}"}
 
-
-@app.post("/image-explain/")
-async def image_explain(file: UploadFile = File(...)):
+@app.post("/explain-image/")
+async def explain_image(file: UploadFile = File(...), explanation_level: str = Form("short")):
     try:
-        explanation = {
-            "explanation_steps": [
-                "Image normalization and preprocessing",
-                "Model extracts feature maps via convolution",
-                "Model focuses on regions of highest information gain",
-                "Layered feature importances are computed",
-                "Final AI prediction is explained layer-by-layer (see SHAP/LIME dashboard or microservice)"
-            ],
-            "shap_value_stub": [
-                {"area":"upper_left", "importance":0.15},
-                {"area":"center", "importance":0.32},
-                {"area":"lower_right", "importance":0.19}
-            ],
-            "note":
-                "RUN true explainable AI (SHAP, LIME) in an API/microservice with isolated modern numpy and model. "
-                "This stub keeps app compatible with your CSV/numpy setup."
-        }
-        return explanation
-    except Exception as e:
-        return {"error": f"Failed to provide explanation: {str(e)}"}
-
-
-@app.post("/image-advanced/")
-async def image_advanced(file: UploadFile = File(...)):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
             content = await file.read()
-            temp_file.write(content)
-            temp_path = temp_file.name
-        img = Image.open(temp_path)
-        width, height = img.size
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        stat = ImageStat.Stat(img)
-        info = {
-            "aspect_ratio": round(width / height, 3) if height else None,
-            "brightness": round(np.mean(img.convert("L")), 2),
-            "contrast": round(np.std(np.array(img.convert("L"))), 2),
-            "entropy": round(img.convert("L").entropy(), 2) if hasattr(img, "entropy") else None
+        img = Image.open(tmp_path).convert("RGB")
+
+        gray = img.convert("L")
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edges_arr = np.array(edges).astype(np.float32)
+        edges_norm = (edges_arr / edges_arr.max()) * 255.0 if edges_arr.max() > 0 else edges_arr
+        edges_vis = np.stack([edges_norm, edges_norm, edges_norm], axis=-1).astype(np.uint8)
+        saliency_img = Image.fromarray(edges_vis)
+        saliency_b64 = _img_to_base64(saliency_img, fmt="PNG")
+
+        steps = [
+            "1) Input image is loaded and converted to RGB.",
+            "2) Basic pixel-level statistics are computed (brightness / contrast).",
+            "3) Edge detection (simple FIND_EDGES) highlights high-frequency regions (text, boundaries).",
+            "4) Color clustering (KMeans) identifies dominant palette colors.",
+            "5) OCR (if requested previously) extracts embedded text via Tesseract.",
+            "6) Results are packaged into human-readable features and visual maps."
+        ]
+        if explanation_level == "short":
+            steps = steps[:3]
+
+        stat = ImageStat.Stat(img.convert("L"))
+        avg_brightness = float(stat.mean[0])
+        contrast = float(stat.stddev[0])
+        feature_summary = {
+            "avg_brightness": round(avg_brightness, 2),
+            "contrast": round(contrast, 2),
+            "size": {"width": img.width, "height": img.height},
+            "mode": img.mode,
         }
-        img.close()
-        os.unlink(temp_path)
-        return info
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        return {
+            "explanation_steps": steps,
+            "saliency_image": saliency_b64,
+            "feature_summary": feature_summary
+        }
+
     except Exception as e:
-        return {"error": f"Failed to perform advanced analysis: {str(e)}"}
+        return {"error": f"Failed to generate explanation: {str(e)}"}
+
+# ---------------- New advanced-analysis + specialized endpoints ----------------
+
+def _detect_domains_from_features(features: dict, ocr_text: str):
+    """
+    Heuristic domain detection:
+    - If OCR text length > threshold -> 'document'
+    - If greens dominate -> 'nature'
+    - If high contrast and compact palette -> 'product'
+    - If portrait ratio -> 'portrait'
+    - fallback -> 'general'
+    """
+    domains = []
+    txt_len = len(ocr_text.strip()) if ocr_text else 0
+
+    if txt_len > 20:
+        domains.append("document")
+
+    dom_colors = [c.lstrip("#") for c in features.get("dominant_colors", [])]
+    hex_vals = []
+    for h in dom_colors:
+        try:
+            r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
+            hex_vals.append((r,g,b))
+        except Exception:
+            continue
+
+    greens = sum(1 for (r,g,b) in hex_vals if g > r and g > b and g > 100)
+    if greens >= 1 and "nature" not in domains:
+        domains.append("nature")
+
+    if features.get("contrast", 0) > 30 and len(hex_vals) <= 4 and "product" not in domains:
+        domains.append("product")
+
+    size = features.get("size") or {"width": features.get("width"), "height": features.get("height")}
+    try:
+        w = int(size.get("width") or 0); h = int(size.get("height") or 0)
+        if h > 1.2 * w and "portrait" not in domains:
+            domains.append("portrait")
+    except Exception:
+        pass
+
+    ordered = []
+    for d in domains:
+        if d not in ordered:
+            ordered.append(d)
+    if not ordered:
+        ordered = ["general"]
+    return ordered
+
+@app.post("/advanced-analysis/")
+async def advanced_analysis(file: UploadFile = File(...), k_colors: int = Form(4)):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        img = Image.open(tmp_path).convert("RGB")
+        width, height = img.size
+        stat = ImageStat.Stat(img.convert("L"))
+        avg_brightness = float(stat.mean[0])
+        contrast = float(stat.stddev[0])
+
+        arr = np.array(img)
+        pixels = arr.reshape(-1,3).astype(np.float32)
+        max_samples = 30000
+        sample_pixels = pixels[np.random.choice(pixels.shape[0], min(pixels.shape[0], max_samples), replace=False)]
+
+        try:
+            km = KMeans(n_clusters=max(1, int(k_colors)), random_state=42)
+            km.fit(sample_pixels)
+            centers = km.cluster_centers_.astype(int)
+            dominant_hex = ['#%02x%02x%02x' % tuple(c) for c in centers]
+        except Exception:
+            avg_col = tuple(np.mean(sample_pixels, axis=0).astype(int).tolist())
+            dominant_hex = ['#%02x%02x%02x' % tuple(avg_col)]
+
+        ocr_text = ""
+        try:
+            ocr_text = pytesseract.image_to_string(img.convert("RGB")).strip()
+        except Exception:
+            ocr_text = ""
+
+        feature_summary = {
+            "avg_brightness": round(avg_brightness,2),
+            "contrast": round(contrast,2),
+            "size": {"width": width, "height": height},
+            "mode": img.mode
+        }
+
+        gray = img.convert("L")
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edges_arr = np.array(edges).astype(np.float32)
+        edges_norm = (edges_arr / edges_arr.max()) * 255.0 if edges_arr.max()>0 else edges_arr
+        saliency_img = Image.fromarray(np.stack([edges_norm, edges_norm, edges_norm], axis=-1).astype(np.uint8))
+        saliency_b64 = _img_to_base64(saliency_img)
+
+        feat_obj = {
+            "dominant_colors": dominant_hex,
+            "avg_brightness": round(avg_brightness,2),
+            "contrast": round(contrast,2),
+            "width": width,
+            "height": height,
+            "size": {"width": width, "height": height}
+        }
+
+        domains = _detect_domains_from_features(feat_obj, ocr_text)
+
+        action_map = {
+            "document": [
+                {"id":"table_extract", "label":"Table / Layout Extraction", "description":"Try to extract tables, key-value fields and layout from document-like images.", "endpoint":"/specialized/table-extract/"},
+                {"id":"document_ner", "label":"Document Entity Extraction", "description":"Run NER and structured parsing tailored to invoices/receipts.", "endpoint":"/specialized/document-ner/"}
+            ],
+            "product": [
+                {"id":"logo_detect", "label":"Logo / Branding Detection", "description":"Detect logos, brand names and packaging text.", "endpoint":"/specialized/logo-detect/"},
+                {"id":"color_palette", "label":"Packaging Color Analysis", "description":"Detailed color breakdown for packaging design.", "endpoint":"/specialized/packaging-analysis/"}
+            ],
+            "nature": [
+                {"id":"plant_id", "label":"Plant/Species Detector (placeholder)", "description":"Attempt to identify plant/flower types using color/shape heuristics or models.", "endpoint":"/specialized/plant-id/"},
+            ],
+            "portrait": [
+                {"id":"face_attributes", "label":"Face Attributes (age/gender)", "description":"Estimate facial attributes (placeholder).", "endpoint":"/specialized/face-attributes/"},
+            ],
+            "general": [
+                {"id":"edge_stats", "label":"Edge / Texture Statistics", "description":"Deeper texture analysis and image quality metrics.", "endpoint":"/specialized/texture-analysis/"}
+            ]
+        }
+
+        suggested = []
+        seen = set()
+        for d in domains:
+            for a in action_map.get(d, action_map.get("general", [])):
+                if a["id"] not in seen:
+                    suggested.append(a)
+                    seen.add(a["id"])
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        return {
+            "features": feat_obj,
+            "explanation": {
+                "explanation_steps": [
+                    "Loaded image and computed brightness/contrast.",
+                    "Computed dominant colors via clustering.",
+                    "Computed saliency via simple edge detection."
+                ],
+                "saliency_image": saliency_b64,
+                "feature_summary": feature_summary
+            },
+            "ocr_text": ocr_text,
+            "domain_suggestions": domains,
+            "suggested_actions": suggested
+        }
+
+    except Exception as e:
+        return {"error": f"advanced analysis failed: {str(e)}"}
+
+# ---------------- Placeholder specialized endpoints ----------------
+
+@app.post("/specialized/table-extract/")
+async def specialized_table_extract(file: UploadFile = File(...)):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        img = Image.open(tmp_path)
+        text = ""
+        try:
+            text = pytesseract.image_to_string(img).strip()
+        except Exception:
+            text = ""
+
+        lines = [l for l in text.splitlines() if l.strip()]
+        rows = []
+        for ln in lines:
+            if any(ch.isdigit() for ch in ln) or ('|' in ln) or (',' in ln and any(c.isdigit() for c in ln)):
+                rows.append(ln.strip())
+
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+        return {"rows": rows, "raw_text": text}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/specialized/logo-detect/")
+async def specialized_logo_detect(file: UploadFile = File(...)):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        img = Image.open(tmp_path).convert("RGB")
+        text = ""
+        try:
+            text = pytesseract.image_to_string(img).strip()
+        except:
+            text = ""
+        arr = np.array(img)
+        hist_r, _ = np.histogram(arr[:,:,0].flatten(), bins=8, range=(0,255))
+        hist_g, _ = np.histogram(arr[:,:,1].flatten(), bins=8, range=(0,255))
+        hist_b, _ = np.histogram(arr[:,:,2].flatten(), bins=8, range=(0,255))
+        colors = {
+            "r_hist": hist_r.tolist(),
+            "g_hist": hist_g.tolist(),
+            "b_hist": hist_b.tolist()
+        }
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        return {"ocr_text": text, "color_hist": colors}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/specialized/plant-id/")
+async def specialized_plant_id(file: UploadFile = File(...)):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        img = Image.open(tmp_path).convert("RGB")
+        arr = np.array(img)
+        avg = tuple(np.mean(arr.reshape(-1,3), axis=0).astype(int).tolist())
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        return {"message": "Plant ID placeholder — result may be inaccurate", "avg_color": '#%02x%02x%02x' % tuple(avg)}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/specialized/face-attributes/")
+async def specialized_face_attributes(file: UploadFile = File(...)):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        img = Image.open(tmp_path)
+        w,h = img.size
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        return {"note":"Face attributes placeholder — use a face detector model for production", "width": w, "height": h}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/specialized/texture-analysis/")
+async def specialized_texture_analysis(file: UploadFile = File(...)):
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1] or ".png") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+        img = Image.open(tmp_path).convert("L")
+        arr = np.array(img).astype(np.float32)
+        # simple texture metrics: mean, std, entropy-like approx
+        mean = float(arr.mean())
+        std = float(arr.std())
+        # approximate entropy by histogram
+        hist, _ = np.histogram(arr.flatten(), bins=64, range=(0,255))
+        probs = hist / (hist.sum() + 1e-9)
+        entropy = -float((probs * np.log(probs + 1e-9)).sum())
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        return {"mean": round(mean,2), "std": round(std,2), "entropy": round(entropy,3)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
+# @app.post("/process-image/")
+# async def process_image(file: UploadFile = File(...)):
+#     try:
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+#             content = await file.read()
+#             temp_file.write(content)
+#             temp_path = temp_file.name
+#         img = Image.open(temp_path)
+#         width, height = img.size
+#         try:
+#             ocr_raw = pytesseract.image_to_string(img)
+#             ocr_text = ''.join(c for c in ocr_raw if c.isprintable())
+#         except Exception:
+#             ocr_text = "OCR failed or not available"
+        
+#         analysis = {
+#             "dimensions": {"width": width, "height": height},
+#             "format": img.format,
+#             "mode": img.mode,
+#             "extracted_text": ocr_text.strip() if ocr_text else "No text detected"
+#         }
+#         img.close()
+#         os.unlink(temp_path)
+#         return analysis
+#     except Exception as e:
+#         return {"error": f"Failed to process image: {str(e)}"}
+
+# @app.post("/image-features/")
+# async def image_features(file: UploadFile = File(...)):
+#     try:
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+#             content = await file.read()
+#             temp_file.write(content)
+#             temp_path = temp_file.name
+#         img = Image.open(temp_path)
+
+#         stat = ImageStat.Stat(img)
+#         mode = img.mode
+#         features = {}
+#         if mode in ['RGB', 'RGBA']:
+#             features["mean_color"] = { 
+#                 "R": round(stat.mean[0],2), 
+#                 "G": round(stat.mean[1],2), 
+#                 "B": round(stat.mean[2],2) 
+#             }
+#             features["stddev_color"] = { 
+#                 "R": round(stat.stddev[0],2), 
+#                 "G": round(stat.stddev[1],2), 
+#                 "B": round(stat.stddev[2],2)
+#             }
+#         else:
+#             features["mean_gray"] = round(stat.mean[0],2)
+#             features["stddev_gray"] = round(stat.stddev[0],2)
+#         hist = img.histogram()
+#         features["histogram_preview"] = hist[:32]
+
+#         img.close()
+#         os.unlink(temp_path)
+#         return features
+#     except Exception as e:
+#         return {"error": f"Failed to extract features: {str(e)}"}
+
+
+# @app.post("/image-explain/")
+# async def image_explain(file: UploadFile = File(...)):
+#     try:
+#         explanation = {
+#             "explanation_steps": [
+#                 "Image normalization and preprocessing",
+#                 "Model extracts feature maps via convolution",
+#                 "Model focuses on regions of highest information gain",
+#                 "Layered feature importances are computed",
+#                 "Final AI prediction is explained layer-by-layer (see SHAP/LIME dashboard or microservice)"
+#             ],
+#             "shap_value_stub": [
+#                 {"area":"upper_left", "importance":0.15},
+#                 {"area":"center", "importance":0.32},
+#                 {"area":"lower_right", "importance":0.19}
+#             ],
+#             "note":
+#                 "RUN true explainable AI (SHAP, LIME) in an API/microservice with isolated modern numpy and model. "
+#                 "This stub keeps app compatible with your CSV/numpy setup."
+#         }
+#         return explanation
+#     except Exception as e:
+#         return {"error": f"Failed to provide explanation: {str(e)}"}
+
+
+# @app.post("/image-advanced/")
+# async def image_advanced(file: UploadFile = File(...)):
+#     try:
+#         with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as temp_file:
+#             content = await file.read()
+#             temp_file.write(content)
+#             temp_path = temp_file.name
+#         img = Image.open(temp_path)
+#         width, height = img.size
+
+#         stat = ImageStat.Stat(img)
+#         info = {
+#             "aspect_ratio": round(width / height, 3) if height else None,
+#             "brightness": round(np.mean(img.convert("L")), 2),
+#             "contrast": round(np.std(np.array(img.convert("L"))), 2),
+#             "entropy": round(img.convert("L").entropy(), 2) if hasattr(img, "entropy") else None
+#         }
+#         img.close()
+#         os.unlink(temp_path)
+#         return info
+#     except Exception as e:
+#         return {"error": f"Failed to perform advanced analysis: {str(e)}"}
 
