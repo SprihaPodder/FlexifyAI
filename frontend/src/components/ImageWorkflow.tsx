@@ -7,7 +7,9 @@ interface ImageWorkflowProps {
   onBack: () => void;
 }
 
-const BACKEND_URL = "https://flexifyai.onrender.com";
+// const BACKEND_URL = "https://flexifyai.onrender.com";
+const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '0.0.0.0';
+const BACKEND_URL = isLocal ? 'http://0.0.0.0:10000' : 'https://flexifyai.onrender.com';
 
 export const ImageWorkflow: React.FC<ImageWorkflowProps> = ({ file, onBack }) => {
   const [isProcessing, setIsProcessing] = useState(false);
