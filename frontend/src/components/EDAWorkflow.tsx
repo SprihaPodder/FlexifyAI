@@ -13,7 +13,7 @@ interface EDAWorkflowProps {
   onBack: () => void;
 }
 
-const BACKEND_URL = "http://localhost:8000"; 
+const BACKEND_URL = "https://flexifyai.onrender.com"; 
 
 export const EDAWorkflow: React.FC<EDAWorkflowProps> = ({ file, onBack }) => {
   const [columns, setColumns] = useState<Column[]>([]);

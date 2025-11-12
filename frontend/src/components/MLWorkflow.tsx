@@ -17,7 +17,7 @@ type MLModel =
 
 type Step = 'model' | 'preprocessing' | 'training' | 'results';
 
-const BACKEND_URL = 'http://localhost:8000';
+const BACKEND_URL = 'https://flexifyai.onrender.com';
 
 export const MLWorkflow: React.FC<MLWorkflowProps> = ({ file, onBack }) => {
   const [currentStep, setCurrentStep] = useState<Step>('model');

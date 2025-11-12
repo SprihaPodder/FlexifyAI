@@ -51,7 +51,7 @@ interface EntitiesResults {
   PERCENT: string[];
 }
 
-const BACKEND_URL = "http://localhost:8000";
+const BACKEND_URL = "https://flexifyai.onrender.com";
 
 export const TextWorkflow: React.FC<TextWorkflowProps> = ({ file, onBack }) => {
   
