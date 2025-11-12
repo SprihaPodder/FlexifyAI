@@ -84,7 +84,7 @@ MODEL_MAP = {
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://your-frontend-url.onrender.com"],  
+    allow_origins=["https://flexifyai-1.onrender.com"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
